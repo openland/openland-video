@@ -55,7 +55,7 @@ function convertParameters(src: any) {
         });
 
         let transport1: mediasoup.types.WebRtcTransport = await router.createWebRtcTransport({
-            listenIps: ['127.0.0.1'],
+            listenIps: ['127.0.0.1'], // Does not work with 0.0.0.0
             enableTcp: true,
             enableUdp: true,
             preferTcp: false,
@@ -173,7 +173,7 @@ function convertParameters(src: any) {
                 icelite: 'ice-lite',
                 iceUfrag: transport1.iceParameters.usernameFragment,
                 icePwd: transport1.iceParameters.password,
-                // msidSemantic: { semantic: 'WMS', token: '*' },
+                msidSemantic: { semantic: 'WMS', token: '*' },
 
                 // Media
                 media: [{
