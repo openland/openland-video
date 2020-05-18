@@ -14,6 +14,7 @@
         console.log(e.track);
         var player = new Audio();
         player.srcObject = new MediaStream([e.track]);
+        player.setAttribute('playsinline', 'true');
         player.play();
     };
     let offer2 = await (await fetch('/receive', { method: 'POST' })).text();

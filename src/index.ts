@@ -1,9 +1,18 @@
-import * as mediasoup from 'mediasoup';
 import express from 'express';
 import bodyParser from 'body-parser';
 import sdpTransform from 'sdp-transform';
+import * as nats from 'ts-nats';
+import { extractFingerprint, parseSDP } from './sdp/SDP';
+import {
+    IceCandidate,
+    WebRtcTransport,
+    Producer,
+    RtpCodecParameters,
+    connectToCluster,
+    RtpEncoding
+} from 'mediakitchen';
 
-function convertIceCandidate(src: mediasoup.types.IceCandidate) {
+function convertIceCandidate(src: IceCandidate) {
     let res: {
         foundation: string;
         component: number;
@@ -36,11 +45,12 @@ function convertParameters(src: any) {
 
 (async () => {
     try {
-        let worker = await mediasoup.createWorker({ logLevel: 'debug', logTags: ['dtls', 'ice', 'rtp', 'rtcp', 'bwe', 'score'] });
-        worker.on('dies', () => {
-            // TODO: Handle
-            console.log('dies');
-        });
+        let key = Math.random() + '1111';
+        let nc = await nats.connect({ payload: nats.Payload.JSON });
+        console.log('connecting');
+        let cluster = await connectToCluster({ nc });
+        console.log(cluster.workers);
+        let worker = cluster.workers[0];
 
         // Router
         let router = await worker.createRouter({
@@ -53,17 +63,16 @@ function convertParameters(src: any) {
                     { type: 'transport-cc' }
                 ]
             }]
-        });
+        }, key + 'samplerouter');
 
-        let transport1!: mediasoup.types.WebRtcTransport;
-        let transport2: mediasoup.types.WebRtcTransport = await router.createWebRtcTransport({
-            listenIps: ['127.0.0.1'], // Does not work with 0.0.0.0
+        let transport1!: WebRtcTransport;
+        let transport2: WebRtcTransport = await router.createWebRtcTransport({
             enableTcp: true,
             enableUdp: false,
             preferTcp: false,
             preferUdp: false,
-        });
-        let producer!: mediasoup.types.Producer;
+        }, key + 'transport2');
+        let producer!: Producer;
 
         // let router = new ManagedRouter(worker);
         // router.apply({
@@ -120,13 +129,41 @@ function convertParameters(src: any) {
         });
 
         app.post('/offer', bodyParser.text(), async (req, res) => {
-            let sdp = req.body as string;
-            let parsed = sdpTransform.parse(sdp);
-            let m = parsed.media[0];
-            console.log(parsed);
-            console.log(m);
+            let sdp = parseSDP(req.body as string);
+
+            // Extract DTLS fingerprint
+            let fingerprint = extractFingerprint(sdp);
+            if (!fingerprint) {
+                throw Error('No fingerprint provided');
+            }
+
+            // Create Transport
+            transport1 = await router.createWebRtcTransport({
+                enableTcp: true,
+                enableUdp: false,
+                preferTcp: false,
+                preferUdp: false,
+            }, key + 'transport1');
+            // transport1.on('icestatechange', (iceState) => {
+            //     console.log('ICE State: ' + iceState);
+            // });
+            // transport1.on('dtlsstatechange', (dtlsState) => {
+            //     console.log('TDLS State: ' + dtlsState);
+            // });
+            await transport1.connect({
+                dtlsParameters: {
+                    role: 'server',
+                    fingerprints: [{
+                        algorithm: fingerprint.algorithm,
+                        value: fingerprint.value
+                    }]
+                }
+            })
+
+            // Media
+            let m = sdp.media[0];
             let codecs = m.rtp.filter((v) => v.codec === 'opus');
-            let codecParameters: mediasoup.types.RtpCodecParameters[] = [];
+            let codecParameters: RtpCodecParameters[] = [];
             for (let c of codecs) {
                 let fmt = m.fmtp.find((v) => v.payload === c.payload);
                 let params: any = {};
@@ -152,60 +189,19 @@ function convertParameters(src: any) {
                     }]
                 })
             }
-            let encodings: mediasoup.types.RtpEncodingParameters[] = [];
+            let encodings: RtpEncoding[] = [];
             encodings.push({
                 ssrc: m.ssrcs![0].id as number
             });
 
-            // Create Transport
-            transport1 = await router.createWebRtcTransport({
-                listenIps: ['127.0.0.1'], // Does not work with 0.0.0.0
-                enableTcp: true,
-                enableUdp: false,
-                preferTcp: false,
-                preferUdp: false,
-            });
-            transport1.on('icestatechange', (iceState) => {
-                console.log('Ice State: ' + iceState);
-            });
-            transport1.on('dtlsstatechange', (dtlsState) => {
-                console.log('TDLS State: ' + dtlsState);
-            });
-            await transport1.connect({
-                dtlsParameters: {
-                    role: 'client',
-                    fingerprints: [{
-                        algorithm: parsed.media[0].fingerprint!.type,
-                        value: parsed.media[0].fingerprint!.hash
-                    }]
-                }
-            })
-
             producer = await transport1.produce({
+                paused: false,
                 kind: 'audio',
                 rtpParameters: {
                     codecs: codecParameters,
                     encodings,
                 }
-            });
-
-            let obs = await router.createAudioLevelObserver({
-                maxEntries: 1,
-                threshold: -70,
-                interval: 2000
-            });
-            await obs.addProducer({ producerId: producer.id });
-            obs.on('volumes', () => {
-                console.log('Volumes!');
-            });
-            obs.on('silence', () => {
-                console.log('silence');
-            })
-            await obs.resume();
-
-            // setInterval(async () => {
-            //     console.log(await producer.getStats());
-            // }, 1000);
+            }, key + 'producer1');
 
             let sdp2: sdpTransform.SessionDescription = {
 
@@ -262,7 +258,7 @@ function convertParameters(src: any) {
                     })),
 
                     // ICE + DTLS
-                    setup: 'passive',
+                    setup: 'active',
                     connection: { ip: '127.0.0.1', version: 4 },
                     candidates: transport1.iceCandidates.map((v) => convertIceCandidate(v)),
                     endOfCandidates: 'end-of-candidates',
@@ -276,21 +272,20 @@ function convertParameters(src: any) {
 
             // Create Transport
             transport2 = await router.createWebRtcTransport({
-                listenIps: ['127.0.0.1'], // Does not work with 0.0.0.0
                 enableTcp: true,
                 enableUdp: false,
                 preferTcp: false,
                 preferUdp: false,
-            });
-            transport2.on('icestatechange', (iceState) => {
-                console.log('Ice State: ' + iceState);
-            });
-            transport2.on('dtlsstatechange', (dtlsState) => {
-                console.log('TDLS State: ' + dtlsState);
-            });
+            }, key + 'transport2');
+            // transport2.on('icestatechange', (iceState) => {
+            //     console.log('Ice State: ' + iceState);
+            // });
+            // transport2.on('dtlsstatechange', (dtlsState) => {
+            //     console.log('TDLS State: ' + dtlsState);
+            // });
 
-            const consumer = await transport2.consume({
-                producerId: producer.id,
+            const consumer = await transport2.consume(producer.id, {
+                paused: false,
                 rtpCapabilities: {
                     codecs: [{
                         kind: 'audio',
@@ -306,7 +301,7 @@ function convertParameters(src: any) {
                         }]
                     }]
                 }
-            });
+            }, key + 'consume1');
             console.log(consumer.rtpParameters);
 
             let sdp2: sdpTransform.SessionDescription = {

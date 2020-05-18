@@ -2,7 +2,7 @@
 (async () => {
     let devices = await navigator.mediaDevices.enumerateDevices();
     console.log(devices);
-    let media = await navigator.mediaDevices.getUserMedia({ audio: true });
+    let media = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
 
     // Sender Peer Connection
     let pc1 = new RTCPeerConnection({});
